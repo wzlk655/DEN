@@ -6,6 +6,8 @@ from collections import defaultdict
 from numpy import linalg as LA
 from ops import *
 
+# 注意所有计算都是X*W的形式！！！
+
 class DEN(object):
     def __init__(self, config):
         self.T = 0
@@ -63,6 +65,7 @@ class DEN(object):
             return ;
 
         if time == 1:
+            # 第一轮训练，上次的权重并不存在，全部需要重新训练
             self.prev_W = dict()
         for scope_name, param in params.items():
             trainable = True
@@ -246,6 +249,7 @@ class DEN(object):
             b = b[:stamp[self.n_layers]]
             self.y = tf.matmul(bottom, w) + b
         else:
+            # 普通的搭建过程，输出层是预测的概率
             for i in range(1, self.n_layers):
                 w = self.get_variable('layer%d'%i, 'weight', True)
                 b = self.get_variable('layer%d'%i, 'biases', True)
@@ -281,6 +285,7 @@ class DEN(object):
 
     def optimization(self, prev_W, selective = False, splitting = False, expansion = None):
         if selective:
+            # 只训练top层，即最后的分类层
             all_var = [ var for var in tf.trainable_variables() if 'layer%d'%self.n_layers in var.name ]
         else:
             all_var = [ var for var in tf.trainable_variables() ]
@@ -314,30 +319,39 @@ class DEN(object):
         grads = opt.compute_gradients(losses, all_var)
         apply_grads = opt.apply_gradients(grads, global_step = self.g_step)
 
+        # 全局l1正则化，确保稀疏性的，使用l1正则，但是不能简单添加损失项，因为绝对值无法求梯度
         l1_var = [ var for var in tf.trainable_variables() ]
         l1_op_list = []
+        # tf.control_dependencies主要是确保依赖的操作执行完毕后才执行之后的操作
         with tf.control_dependencies([apply_grads]):
             for var in l1_var:
                 th_t = tf.fill(tf.shape(var), tf.convert_to_tensor(self.l1_lambda))
                 zero_t = tf.zeros(tf.shape(var))
                 var_temp = var - (th_t * tf.sign(var))
+                # 如果val的值小于l1的阈值那么就置为0，否则减少var。（其实就是绝对值求导后的梯度(1或-1)*λ）
                 l1_op = var.assign(tf.where(tf.less(tf.abs(var), th_t), zero_t, var_temp))
                 l1_op_list.append(l1_op)
 
+        # 只包含了新extend的神经元
         GL_var = [var for var in tf.trainable_variables() if 'new' in var.name and ('bw' in var.name or 'tw' in var.name)]
         gl_op_list = []
+        # 额外的group lasso正则化，组间Lasso，组内l2
+        # 主要目的是确保新添加的神经元只和它找到的关键的部分神经元连接
         with tf.control_dependencies([apply_grads]):
             for var in GL_var:
                 g_sum = tf.sqrt(tf.reduce_sum(tf.square(var), 0))
                 th_t = self.gl_lambda
                 gw = []
                 for i in range(var.get_shape()[1]):
+                    # 同一个group指的是到这一层的同一个神经元的连接，如果某一组的连接很小，那么就会整体被置0，相当于神经元断开
+                    # 这里除以g_sum的加权，应该是让平均权重（绝对值）越大的神经元，被减少的越少，加速收敛？
                     temp_gw = var[:, i] - (th_t * var[:, i] / g_sum[i])
                     gw_gl = tf.where(tf.less(g_sum[i], th_t), tf.zeros(tf.shape(var[:, i])), temp_gw)
                     gw.append(gw_gl)
                 gl_op = var.assign(tf.stack(gw, 1))
                 gl_op_list.append(gl_op)
 
+        # tf小技巧，使用tf.control_dependencies包tf.no_op，使得no_op实际上是对dependencies中所有东西的计算
         with tf.control_dependencies(l1_op_list + gl_op_list):
             self.opt = tf.no_op()
 
@@ -353,6 +367,7 @@ class DEN(object):
         self.Y = tf.placeholder(tf.float32, [None, self.n_classes])
         
     def add_task(self, task_id, data):
+        # 对应论文Algorithm 1
         trainX, trainY, self.valX, self.valY, testX, testY = data
         self.train_range = np.array(range(len(trainY)))
         data_size = len(trainX)
@@ -370,12 +385,15 @@ class DEN(object):
         else:
             """ SELECTIVE LEARN """
             print(' [*] Selective retraining')
+            # 只训练最高层的分类层
             self.optimization(self.prev_W, selective = True)
             self.sess.run(tf.global_variables_initializer())
 
+            # TODO:这里s_iter（当前开始处于的论数）不应该是0吗，不然这不是一开始就结束了？
             repeated, c_loss = self.run_epoch(
                 self.opt, self.loss, trainX, trainY, 'Train', selective = True, s_iter = self.early_training)
 
+            # 获得各个层权重的值，用于找到不为0的连接
             params = self.get_params()
             self.destroy_graph()
             self.sess = tf.Session()
@@ -384,20 +402,26 @@ class DEN(object):
             selected_prev_params = dict()
             selected_params = dict()
             all_indices = defaultdict(list) # nonzero unis 
+            # 下面的代码是BFS，宽度优先搜索与激活的输出相连接的神经元
             for i in range(self.n_layers, 0, -1):
                 if i == self.n_layers:
                     w = params['layer%d/weight_%d:0'%(i, task_id)]
                     b = params['layer%d/biases_%d:0'%(i, task_id)]
+                    # TODO:这是把w中第一个神经元作为整体的代表？连接了第一个输出的算？为什么要这样？
                     for j in range(w.shape[0]):
                         if w[j, 0] != 0: 
                             all_indices['layer%d'%i].append(j)
+                    # np.ix_相当于横纵坐标拼接成二维索引
                     selected_params['layer%d/weight_%d:0'%(i, task_id)] = w[np.ix_(all_indices['layer%d'%i], [0])]
-                    selected_params['layer%d/biases_%d:0'%(i, task_id)] = b
+                    selected_params['layer%d/biases_%d:0'%(i, task_id)] = b  # TODO:这里为什么不索引？
                 else:
+                    # 这部分各个任务是共用的，所以不加task_id
                     w = params['layer%d/weight:0'%i]
                     b = params['layer%d/biases:0'%i]
                     top_indices = all_indices['layer%d'%(i+1)]
                     for j in range(w.shape[0]):
+                        # 下层神经元到上层的连接如果不全为0就是
+                        # i=1是因为层数从1开始算，1是连接输入的，所以不做部分连接
                         if np.count_nonzero(w[j, top_indices]) != 0 or i == 1: 
                             all_indices['layer%d'%i].append(j)
 
@@ -570,6 +594,7 @@ class DEN(object):
 
 
     def run_epoch(self, opt, loss, X, Y, desc = 'Train', selective = False, s_iter = 0, print_pred=True):
+        # s_iter:指示现在在第几轮（因为有前几轮只训练top层的情况）
         c_iter, old_loss, window_size = s_iter, 999, 10
         loss_window = collections.deque(maxlen = window_size)
         while(self.max_iter > c_iter):
